@@ -145,7 +145,21 @@ class ModelLumina2(ModelTemplate):
         ("cap_embedder.1.weight", "context_refiner.0.attention.qkv.weight")
     ]
 
-arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2, 
+class ModelQwenImage21(ModelTemplate):
+    # Qwen-Image 2.1 (7B, Qwen3-VL text encoder). Matches ComfyUI's own detection keys;
+    # stable-diffusion.cpp GGUFs carry no general.architecture field.
+    arch = "qwen_image21"
+    keys_detect = [
+        (
+            "txt_in.text_norm.weight",
+            "modulation.1.weight",
+            "transformer_blocks.0.attn.norm_q.weight",
+            "img_in.weight",
+            "proj_out.weight",
+        )
+    ]
+
+arch_list = [ModelQwenImage21, ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
              ModelLTXV, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2]
 
 def is_model_arch(model, state_dict):

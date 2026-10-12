@@ -9,7 +9,7 @@ import os
 from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 
-IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image"}
+IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "hyvid", "wan", "lumina2", "qwen_image", "qwen_image21"}
 TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "gemma3"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 
@@ -262,16 +262,14 @@ def gemma3_norm_corrections(sd):
     return sd
 
 def strip_quant_suffix(name):
-    pattern = r"[-_]?(?:ud-)?i?q[0-9]_[a-z0-9_\-]{1,8}$"
+    # "ud-" (Unsloth dynamic) and "ad-" (Atomic dynamic) prefix the quant type.
+    pattern = r"[-_]?(?:ud-|ad-)?i?q[0-9]_[a-z0-9_\-]{1,8}$"
     match = re.search(pattern, name, re.IGNORECASE)
     if match:
         name = name[:match.start()]
     return name
 
-def gguf_mmproj_loader(path):
-    # Reverse version of Qwen2VLVisionModel.modify_tensors
-    logging.info("Attenpting to find mmproj file for text encoder...")
-
+def find_mmproj_file(path):
     # get name to match w/o quant suffix
     tenc_fname = os.path.basename(path)
     tenc = os.path.splitext(tenc_fname)[0].lower()
@@ -290,13 +288,21 @@ def gguf_mmproj_loader(path):
             target.append(fname)
 
     if len(target) == 0:
-        logging.error(f"Error: Can't find mmproj file for '{tenc_fname}' (matching:'{tenc}')! Qwen-Image-Edit will be broken!")
-        return {}
+        logging.error(f"Error: Can't find mmproj file for '{tenc_fname}' (matching:'{tenc}')!")
+        return None
     if len(target) > 1:
         logging.error(f"Ambiguous mmproj for text encoder '{tenc_fname}', will use first match.")
 
     logging.info(f"Using mmproj '{target[0]}' for text encoder '{tenc_fname}'.")
-    target = os.path.join(root, target[0])
+    return os.path.join(root, target[0])
+
+def gguf_mmproj_loader(path):
+    # Reverse version of Qwen2VLVisionModel.modify_tensors
+    logging.info("Attenpting to find mmproj file for text encoder...")
+    target = find_mmproj_file(path)
+    if target is None:
+        logging.error("Qwen-Image-Edit will be broken without the mmproj file!")
+        return {}
     vsd, _ = gguf_sd_loader(target, is_text_model=True)
 
     # concat 4D to 5D
@@ -332,6 +338,67 @@ def gguf_mmproj_loader(path):
             ], dim=0)
         del attns
 
+    return vsd
+
+QWEN3VL_VISION_SD_MAP = {
+    "v.post_ln.": "model.visual.merger.norm.",
+    "mm.0.": "model.visual.merger.linear_fc1.",
+    "mm.2.": "model.visual.merger.linear_fc2.",
+    "v.patch_embd.": "model.visual.patch_embed.proj.",
+    "v.position_embd.": "model.visual.pos_embed.",
+}
+QWEN3VL_VISION_BLOCK_MAP = {
+    "attn_qkv.": "attn.qkv.",
+    "attn_out.": "attn.proj.",
+    "ffn_up.": "mlp.linear_fc1.",
+    "ffn_down.": "mlp.linear_fc2.",
+    "ln1.": "norm1.",
+    "ln2.": "norm2.",
+}
+QWEN3VL_DEEPSTACK_MAP = {"fc1.": "linear_fc1.", "fc2.": "linear_fc2.", "norm.": "norm."}
+
+def gguf_qwen3vl_mmproj_loader(path):
+    # Reverse version of llama.cpp's Qwen3VLVisionModel.modify_tensors. ComfyUI only
+    # recognises a Qwen3-VL text encoder (as opposed to plain Qwen3) by these vision
+    # tensors, so a text-only llama.cpp GGUF needs its matching mmproj merged in.
+    logging.info("Attempting to find Qwen3-VL mmproj file for text encoder...")
+    target = find_mmproj_file(path)
+    if target is None:
+        logging.error("Qwen3-VL text encoder will be detected as plain Qwen3 without its mmproj file!")
+        return {}
+    raw, _ = gguf_sd_loader(target, is_text_model=True)
+
+    # llama.cpp splits the temporal patch kernel into two 4D tensors
+    if "v.patch_embd.weight.1" in raw:
+        w1 = dequantize_tensor(raw.pop("v.patch_embd.weight"), dtype=torch.float32)
+        w2 = dequantize_tensor(raw.pop("v.patch_embd.weight.1"), dtype=torch.float32)
+        raw["v.patch_embd.weight"] = torch.stack([w1, w2], dim=2)
+
+    deepstack_layers = sorted({int(k.split(".")[2]) for k in raw if k.startswith("v.deepstack.")})
+    vsd = {}
+    for key, value in raw.items():
+        new_key = None
+        for src, dst in QWEN3VL_VISION_SD_MAP.items():
+            if key.startswith(src):
+                new_key = dst + key[len(src):]
+                break
+        if new_key is None and key.startswith("v.blk."):
+            block, rest = key[len("v.blk."):].split(".", 1)
+            for src, dst in QWEN3VL_VISION_BLOCK_MAP.items():
+                if rest.startswith(src):
+                    new_key = f"model.visual.blocks.{block}.{dst}{rest[len(src):]}"
+                    break
+        if new_key is None and key.startswith("v.deepstack."):
+            layer, rest = key[len("v.deepstack."):].split(".", 1)
+            index = deepstack_layers.index(int(layer))
+            for src, dst in QWEN3VL_DEEPSTACK_MAP.items():
+                if rest.startswith(src):
+                    new_key = f"model.visual.deepstack_merger_list.{index}.{dst}{rest[len(src):]}"
+                    break
+        if new_key is None:
+            logging.warning(f"Qwen3-VL mmproj: unmapped tensor {key!r} ignored")
+            continue
+        vsd[new_key] = value
     return vsd
 
 def gguf_tokenizer_loader(path, temb_shape):
@@ -500,6 +567,9 @@ def gguf_clip_loader(path):
             sd = llama_permute(sd, 32, 8) # L3 / Mistral
         if arch == "qwen2vl":
             vsd = gguf_mmproj_loader(path)
+            sd.update(vsd)
+        if arch == "qwen3vl":
+            vsd = gguf_qwen3vl_mmproj_loader(path)
             sd.update(vsd)
     else:
         pass
